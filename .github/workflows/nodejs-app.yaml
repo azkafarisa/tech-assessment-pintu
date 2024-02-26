@@ -1,0 +1,160 @@
+name: Deploy NodeJS App
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'nodejs/**'
+  workflow_dispatch:
+
+concurrency:
+  group: environment-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sonarqube:
+    name: Sonarqube Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      - name: SonarQube Quality Gate check
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+
+  unit-testing:
+    name: Unit Testing
+    needs: sonarqube
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set Up NodeJS
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20.x'
+
+      - name: Unit tests
+        run: |
+              npm install
+              npm run test
+
+      - name: Quality Gate - Test coverage shall be above threshold
+        env:
+            TESTCOVERAGE_THRESHOLD: 80
+        run: |
+              echo "Quality Gate: checking test coverage is above threshold ..."
+              echo "Threshold             : $TESTCOVERAGE_THRESHOLD %"
+              totalCoverage=`go tool cover -func=coverage.out | grep total | grep -Eo '[0-9]+\.[0-9]+'`
+              echo "Current test coverage : $totalCoverage %"
+              if (( $(echo "$totalCoverage $TESTCOVERAGE_THRESHOLD" | awk '{print ($1 >= $2)}') )); then
+                  echo "OK"
+              else
+                  echo "Current test coverage is below threshold. Please add more unit tests or adjust threshold to a lower value."
+                  echo "Failed"
+                  exit 1
+              fi
+
+
+  build-app:
+      name: Build Node
+      needs: unit-testing
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v2
+
+        - name: Set Up NodeJS
+          uses: actions/setup-node@v3
+          with:
+            node-version: '16.x'
+            
+        - name: Build
+          run: |
+                npm install
+                npm run build
+
+        - name: Upload Artifact Apps
+          uses: actions/upload-artifact@v2.2.4
+          with:
+            name: apps
+            path: ${{ github.event.repository.name }}
+
+
+  deploy-to-ecr:
+    name: Deploy to ECR
+    runs-on: ubuntu-latest
+    needs: build-go
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Download Artifact Apps
+        uses: actions/download-artifact@v2
+        with:
+          name: apps
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push the image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: "nodejs-app"
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build a docker container and push it to ECR 
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          echo "Pushing image to ECR..."
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+      
+      - name: Delete Artifact Apps
+        uses: geekyeggo/delete-artifact@v1
+        with:
+          name: apps      
+
+
+  deploy-eks:
+    name: Deploy to EKS Cluster
+    runs-on: ubuntu-latest
+    needs: deploy-ecr
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+    
+    - name: Configure Kube Config
+      uses: tale/kubectl-action@v1
+      with:
+        base64-kube-config: ${{ secrets.KUBE_CONFIG }}
+        kubectl-version: v1.24.2
+
+    - name: Deploy to Kubernetes
+      run: kubectl apply -f ./scripts/k8s/go-app.yaml

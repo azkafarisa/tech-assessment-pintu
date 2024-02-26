@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nodejs-app
+  labels:
+    name: nodejs-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      name: nodejs-app
+  template:
+    metadata:
+      name: nodejs-app
+      labels:
+        name: nodejs-app
+    spec:
+      containers:
+        - name: nodejs-app
+          image: {{CONTAINER_REGISTRY}}/nodejs-app:{{VERSION}}
+          ports:
+            - containerPort: 3000
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodejs-app-service
+spec:
+  selector:
+    name: nodejs-app
+  ports:
+    - port: 3000
+      targetPort: 3000
